@@ -1,2 +1,5 @@
+# 配置文件，用于定义 Git 属性
+# 指示 .py 文件可以被语言识别
+# 指示 .m 文件不被语言识别
 *.py linguist-detectable=true
 *.m linguist-detectable=false
