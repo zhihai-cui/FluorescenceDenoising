@@ -1,5 +1,8 @@
 # Byte-compiled / optimized / DLL files
 __pycache__/
+datasets/
+results/
+experiments/
 *.bat
 *.py[cod]
 *$py.class
