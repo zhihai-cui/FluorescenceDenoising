@@ -5,6 +5,11 @@ import glob
 import datetime
 import argparse
 import numpy as np
+import json
+import random
+from pprint import pprint
+import matplotlib.pyplot as plt
+plt.switch_backend('agg')
 
 import cv2
 from PIL import Image
@@ -15,37 +20,117 @@ from torchvision import transforms
 from torch.utils.data import DataLoader
 from torch.utils.data import Dataset
 
-from arch_unet import UNet
+from models.arch_unet import UNet
+from utils.metrics import cal_psnr
+from utils.data_loader import (load_denoising_n2n_train, 
+                               load_denoising_test_mix, fluore_to_tensor)
+from utils.practices import OneCycleScheduler, adjust_learning_rate, find_lr
+from utils.misc import mkdirs, module_size
+from utils.plot import save_samples, save_stats
 
-parser = argparse.ArgumentParser()
-parser.add_argument("--noisetype", type=str, default="gauss25")
-parser.add_argument('--data_dir', type=str, default='./Imagenet_val')
-parser.add_argument('--val_dirs', type=str, default='./validation')
-parser.add_argument('--save_model_path', type=str, default='./results')
-parser.add_argument('--log_name', type=str, default='unet_gauss25_b4e100r02')
-parser.add_argument('--gpu_devices', default='0', type=str)
-parser.add_argument('--parallel', action='store_true')
-parser.add_argument('--n_feature', type=int, default=48)
-parser.add_argument('--n_channel', type=int, default=3)
-parser.add_argument('--lr', type=float, default=3e-4)
-parser.add_argument('--gamma', type=float, default=0.5)
-parser.add_argument('--n_epoch', type=int, default=100)
-parser.add_argument('--n_snapshot', type=int, default=1)
-parser.add_argument('--batchsize', type=int, default=4)
-parser.add_argument('--patchsize', type=int, default=256)
-parser.add_argument("--Lambda1", type=float, default=1.0)
-parser.add_argument("--Lambda2", type=float, default=1.0)
-parser.add_argument("--increase_ratio", type=float, default=2.0)
 
-opt, _ = parser.parse_known_args()
+class Parser(argparse.ArgumentParser):
+    def __init__(self):
+        super(Parser, self).__init__(description='Training Ne2Ne')
+        self.add_argument('--exp-name', type=str, default='ne2ne', help='experiment name')
+        self.add_argument('--exp-dir', type=str, default="./experiments", help='directory to save experiments')        
+        self.add_argument('--post', action='store_true', default=False, help='post proc mode')
+        self.add_argument('--debug', action='store_true', default=False, help='verbose stdout')
+        self.add_argument('--net', type=str, default='UNet')
+        # data
+        self.add_argument('--data-root', type=str, default="./dataset", help='directory to dataset root')
+        self.add_argument('--imsize', type=int, default=256)
+        self.add_argument('--in-channels', type=int, default=1)
+        self.add_argument('--out-channels', type=int, default=1)
+        self.add_argument('--transform', type=str, default='four_crop', choices=['four_crop', 'center_crop'])
+        self.add_argument('--noise-levels-train', type=list, default=[1, 2, 4, 8, 16])
+        self.add_argument('--noise-levels-test', type=list, default=[1])
+        self.add_argument('--test-group', type=int, default=19)
+        self.add_argument('--captures', type=int, default=50, help='how many captures in each group to load')
+        self.add_argument('--n_feature', type=int, default=48)
+        self.add_argument('--parallel', action='store_true')
+        # training
+        self.add_argument('--epochs', type=int, default=400, help='number of iterations to train')
+        self.add_argument('--batch-size', type=int, default=4, help='input batch size for training')
+        self.add_argument('--lr', type=float, default=3e-4, help='learnign rate')
+        self.add_argument('--wd', type=float, default=0., help="weight decay")
+        self.add_argument('--gamma', type=float, default=0.5)
+        self.add_argument('--Lambda1', type=float, default=1.0)
+        self.add_argument('--Lambda2', type=float, default=1.0)
+        self.add_argument('--increase_ratio', type=float, default=2.0)
+        self.add_argument('--test-batch-size', type=int, default=2, help='input batch size for testing')
+        self.add_argument('--seed', type=int, default=1, help='manual seed used in Tensor')
+        self.add_argument('--cuda', type=int, default=0, help='cuda number')
+        # logging
+        self.add_argument('--ckpt-freq', type=int, default=50, help='how many epochs to wait before saving model')
+        self.add_argument('--print-freq', type=int, default=100, help='how many minibatches to wait before printing training status')
+        self.add_argument('--log-freq', type=int, default=1, help='how many epochs to wait before logging training status')
+        self.add_argument('--plot-epochs', type=int, default=50, help='how many epochs to wait before plotting test output')
+        self.add_argument('--cmap', type=str, default='inferno', help='attach notes to the run dir')
+
+    def parse(self):
+        args = self.parse_args()
+        date = datetime.datetime.now().strftime('%Y-%m-%d-%H-%M')
+        # 构建运行目录路径
+        args.run_dir = args.exp_dir + '/' + args.exp_name + '_' + date
+        
+        # 构建检查点目录路径
+        args.ckpt_dir = args.run_dir + '/checkpoints'
+        args.train_dir = args.run_dir + "/training"
+        args.pred_dir = args.run_dir + "/predictions"
+        
+        
+        if not args.post:
+            mkdirs([args.run_dir, args.ckpt_dir])
+            
+        mkdirs([args.train_dir, args.pred_dir])
+
+        # seed,设置随机种子，以确保结果的可复现性
+        if args.seed is None:
+            args.seed = random.randint(1, 10000)
+        print("Random Seed: ", args.seed)
+        random.seed(args.seed)
+        torch.manual_seed(args.seed)
+        torch.backends.cudnn.benchmark=True
+        
+        print('Arguments:')
+        pprint(vars(args))
+
+        if not args.post:
+            # 将所有解析的参数以JSON格式保存,以便后续查阅和恢复实验配置
+            with open(args.run_dir + "/args.txt", 'w') as args_file:
+                json.dump(vars(args), args_file, indent=4)
+
+        return args
+
+args = Parser().parse()
+
+device = torch.device(f'cuda:{args.cuda}' if torch.cuda.is_available() else 'cpu')
+model = UNet(args.in_channels, args.out_channels).to(device)
+    
+if args.debug:
+    print(model)
+    print(f"Model size: {module_size(model)}")
+
+if args.transform == 'four_crop':
+    # wide field images may have complete noise in center-crop case
+    transform = transforms.Compose([
+        transforms.FiveCrop(args.imsize),
+        transforms.Lambda(lambda crops: torch.stack([
+            fluore_to_tensor(crop) for crop in crops[:4]])),
+        transforms.Lambda(lambda x: x.float().div(255).sub(0.5))
+        ])
+elif args.transform == 'center_crop':
+    # default transform
+    transform = None
+
 systime = datetime.datetime.now().strftime('%Y-%m-%d-%H-%M')
 operation_seed_counter = 0
-os.environ['CUDA_VISIBLE_DEVICES'] = opt.gpu_devices
 
 
 def checkpoint(net, epoch, name):
-    save_model_path = os.path.join(opt.save_model_path, opt.log_name, systime)
-    os.makedirs(save_model_path, exist_ok=True)
+    save_model_path = args.ckpt_dir
+    mkdirs(save_model_path)
     model_name = 'epoch_{}_{:03d}.pth'.format(name, epoch)
     save_model_path = os.path.join(save_model_path, model_name)
     torch.save(net.state_dict(), save_model_path)
@@ -58,76 +143,6 @@ def get_generator():
     g_cuda_generator = torch.Generator(device="cuda")
     g_cuda_generator.manual_seed(operation_seed_counter)
     return g_cuda_generator
-
-
-class AugmentNoise(object):
-    def __init__(self, style):
-        print(style)
-        if style.startswith('gauss'):
-            self.params = [
-                float(p) / 255.0 for p in style.replace('gauss', '').split('_')
-            ]
-            if len(self.params) == 1:
-                self.style = "gauss_fix"
-            elif len(self.params) == 2:
-                self.style = "gauss_range"
-        elif style.startswith('poisson'):
-            self.params = [
-                float(p) for p in style.replace('poisson', '').split('_')
-            ]
-            if len(self.params) == 1:
-                self.style = "poisson_fix"
-            elif len(self.params) == 2:
-                self.style = "poisson_range"
-
-    def add_train_noise(self, x):
-        shape = x.shape
-        if self.style == "gauss_fix":
-            std = self.params[0]
-            std = std * torch.ones((shape[0], 1, 1, 1), device=x.device)
-            noise = torch.cuda.FloatTensor(shape, device=x.device)
-            torch.normal(mean=0.0,
-                         std=std,
-                         generator=get_generator(),
-                         out=noise)
-            return x + noise
-        elif self.style == "gauss_range":
-            min_std, max_std = self.params
-            std = torch.rand(size=(shape[0], 1, 1, 1),
-                             device=x.device) * (max_std - min_std) + min_std
-            noise = torch.cuda.FloatTensor(shape, device=x.device)
-            torch.normal(mean=0, std=std, generator=get_generator(), out=noise)
-            return x + noise
-        elif self.style == "poisson_fix":
-            lam = self.params[0]
-            lam = lam * torch.ones((shape[0], 1, 1, 1), device=x.device)
-            noised = torch.poisson(lam * x, generator=get_generator()) / lam
-            return noised
-        elif self.style == "poisson_range":
-            min_lam, max_lam = self.params
-            lam = torch.rand(size=(shape[0], 1, 1, 1),
-                             device=x.device) * (max_lam - min_lam) + min_lam
-            noised = torch.poisson(lam * x, generator=get_generator()) / lam
-            return noised
-
-    def add_valid_noise(self, x):
-        shape = x.shape
-        if self.style == "gauss_fix":
-            std = self.params[0]
-            return np.array(x + np.random.normal(size=shape) * std,
-                            dtype=np.float32)
-        elif self.style == "gauss_range":
-            min_std, max_std = self.params
-            std = np.random.uniform(low=min_std, high=max_std, size=(1, 1, 1))
-            return np.array(x + np.random.normal(size=shape) * std,
-                            dtype=np.float32)
-        elif self.style == "poisson_fix":
-            lam = self.params[0]
-            return np.array(np.random.poisson(lam * x) / lam, dtype=np.float32)
-        elif self.style == "poisson_range":
-            min_lam, max_lam = self.params
-            lam = np.random.uniform(low=min_lam, high=max_lam, size=(1, 1, 1))
-            return np.array(np.random.poisson(lam * x) / lam, dtype=np.float32)
 
 
 def space_to_depth(x, block_size):
@@ -309,18 +324,18 @@ def calculate_psnr(target, ref):
 
 
 # Training Set
-TrainingDataset = DataLoader_Imagenet_val(opt.data_dir, patch=opt.patchsize)
+TrainingDataset = DataLoader_Imagenet_val(args.data_dir, patch=args.patchsize)
 TrainingLoader = DataLoader(dataset=TrainingDataset,
                             num_workers=8,
-                            batch_size=opt.batchsize,
+                            batch_size=args.batchsize,
                             shuffle=True,
                             pin_memory=False,
                             drop_last=True)
 
 # Validation Set
-Kodak_dir = os.path.join(opt.val_dirs, "Kodak")
-BSD300_dir = os.path.join(opt.val_dirs, "BSD300")
-Set14_dir = os.path.join(opt.val_dirs, "Set14")
+Kodak_dir = os.path.join(args.val_dirs, "Kodak")
+BSD300_dir = os.path.join(args.val_dirs, "BSD300")
+Set14_dir = os.path.join(args.val_dirs, "Set14")
 valid_dict = {
     "Kodak": validation_kodak(Kodak_dir),
     "BSD300": validation_bsd300(BSD300_dir),
@@ -328,20 +343,20 @@ valid_dict = {
 }
 
 # Noise adder
-noise_adder = AugmentNoise(style=opt.noisetype)
+noise_adder = AugmentNoise(style=args.noisetype)
 
 # Network
-network = UNet(in_nc=opt.n_channel,
-               out_nc=opt.n_channel,
-               n_feature=opt.n_feature)
-if opt.parallel:
+network = UNet(in_nc=args.n_channel,
+               out_nc=args.n_channel,
+               n_feature=args.n_feature)
+if args.parallel:
     network = torch.nn.DataParallel(network)
 network = network.cuda()
 
 # about training scheme
-num_epoch = opt.n_epoch
+num_epoch = args.n_epoch
 ratio = num_epoch / 100
-optimizer = optim.Adam(network.parameters(), lr=opt.lr)
+optimizer = optim.Adam(network.parameters(), lr=args.lr)
 scheduler = lr_scheduler.MultiStepLR(optimizer,
                                      milestones=[
                                          int(20 * ratio) - 1,
@@ -349,13 +364,13 @@ scheduler = lr_scheduler.MultiStepLR(optimizer,
                                          int(60 * ratio) - 1,
                                          int(80 * ratio) - 1
                                      ],
-                                     gamma=opt.gamma)
-print("Batchsize={}, number of epoch={}".format(opt.batchsize, opt.n_epoch))
+                                     gamma=args.gamma)
+print("Batchsize={}, number of epoch={}".format(args.batchsize, args.n_epoch))
 
 checkpoint(network, 0, "model")
 print('init finish')
 
-for epoch in range(1, opt.n_epoch + 1):
+for epoch in range(1, args.n_epoch + 1):
     cnt = 0
 
     for param_group in optimizer.param_groups:
@@ -381,13 +396,13 @@ for epoch in range(1, opt.n_epoch + 1):
 
         noisy_output = network(noisy_sub1)
         noisy_target = noisy_sub2
-        Lambda = epoch / opt.n_epoch * opt.increase_ratio
+        Lambda = epoch / args.n_epoch * args.increase_ratio
         diff = noisy_output - noisy_target
         exp_diff = noisy_sub1_denoised - noisy_sub2_denoised
 
         loss1 = torch.mean(diff**2)
         loss2 = Lambda * torch.mean((diff - exp_diff)**2)
-        loss_all = opt.Lambda1 * loss1 + opt.Lambda2 * loss2
+        loss_all = args.Lambda1 * loss1 + args.Lambda2 * loss2
 
         loss_all.backward()
         optimizer.step()
@@ -399,12 +414,12 @@ for epoch in range(1, opt.n_epoch + 1):
 
     scheduler.step()
 
-    if epoch % opt.n_snapshot == 0 or epoch == opt.n_epoch:
+    if epoch % args.n_snapshot == 0 or epoch == args.n_epoch:
         network.eval()
         # save checkpoint
         checkpoint(network, epoch, "model")
         # validation
-        save_model_path = os.path.join(opt.save_model_path, opt.log_name,
+        save_model_path = os.path.join(args.save_model_path, args.log_name,
                                        systime)
         validation_path = os.path.join(save_model_path, "validation")
         os.makedirs(validation_path, exist_ok=True)
@@ -421,7 +436,7 @@ for epoch in range(1, opt.n_epoch + 1):
                     origin255 = origin255.astype(np.uint8)
                     im = np.array(im, dtype=np.float32) / 255.0
                     noisy_im = noise_adder.add_valid_noise(im)
-                    if epoch == opt.n_snapshot:
+                    if epoch == args.n_snapshot:
                         noisy255 = noisy_im.copy()
                         noisy255 = np.clip(noisy255 * 255.0 + 0.5, 0,
                                            255).astype(np.uint8)
@@ -454,7 +469,7 @@ for epoch in range(1, opt.n_epoch + 1):
                     ssim_result.append(cur_ssim)
 
                     # visualization
-                    if i == 0 and epoch == opt.n_snapshot:
+                    if i == 0 and epoch == args.n_snapshot:
                         save_path = os.path.join(
                             validation_path,
                             "{}_{:03d}-{:03d}_clean.png".format(

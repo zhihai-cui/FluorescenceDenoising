@@ -10,13 +10,6 @@ Dataset:
 import torch
 import torch.nn.functional as F
 from torchvision import transforms
-from models.unet import UnetN2N, UnetN2Nv2
-from utils.metrics import cal_psnr
-from utils.data_loader import (load_denoising_n2n_train, 
-                               load_denoising_test_mix, fluore_to_tensor)
-from utils.practices import OneCycleScheduler, adjust_learning_rate, find_lr
-from utils.misc import mkdirs, module_size
-from utils.plot import save_samples, save_stats
 import numpy as np
 import argparse
 import json
@@ -26,6 +19,14 @@ import sys
 from pprint import pprint
 import matplotlib.pyplot as plt
 plt.switch_backend('agg')
+
+from models.unet import UnetN2N, UnetN2Nv2
+from utils.metrics import cal_psnr
+from utils.data_loader import (load_denoising_n2n_train, 
+                               load_denoising_test_mix, fluore_to_tensor)
+from utils.practices import OneCycleScheduler, adjust_learning_rate, find_lr
+from utils.misc import mkdirs, module_size
+from utils.plot import save_samples, save_stats
 
 
 class Parser(argparse.ArgumentParser):
@@ -62,29 +63,36 @@ class Parser(argparse.ArgumentParser):
         self.add_argument('--cmap', type=str, default='inferno', help='attach notes to the run dir')
 
     def parse(self):
+        # 解析命令行参数,并将解析结果存储在变量args中
         args = self.parse_args()
+        # 格式化日期为 'Mon_01' 的形式
         date = '{}'.format(time.strftime('%b_%d'))
+        # 构建包含实验名称、日期、网络类型、训练噪声水平、测试噪声水平、数据变换方式、
+        # 训练周期数、批量大小和学习率的运行目录路径
         args.run_dir = args.exp_dir + '/' + args.exp_name + '/' + date \
             + f'/{args.net}_noise_train{args.noise_levels_train}_'\
             f'test{args.noise_levels_test}_{args.transform}_'\
             f'epochs{args.epochs}_bs{args.batch_size}_lr{args.lr}'
+        # 构建检查点目录路径
         args.ckpt_dir = args.run_dir + '/checkpoints'
-
+        # args.post用于判断是否在训练结束后进行后处理
         if not args.post:
             mkdirs([args.run_dir, args.ckpt_dir])
 
-        # seed
+        # seed,设置Python和PyTorch的随机种子，以确保结果的可复现性
         if args.seed is None:
             args.seed = random.randint(1, 10000)
         print("Random Seed: ", args.seed)
         random.seed(args.seed)
         torch.manual_seed(args.seed)
         torch.backends.cudnn.benchmark=True
-
+        
         print('Arguments:')
+        # 打印所有解析的参数
         pprint(vars(args))
 
         if not args.post:
+            # 将所有解析的参数以JSON格式保存,以便后续查阅和恢复实验配置
             with open(args.run_dir + "/args.txt", 'w') as args_file:
                 json.dump(vars(args), args_file, indent=4)
 
@@ -100,13 +108,18 @@ if args.net == 'unet':
     model = UnetN2N(args.in_channels, args.out_channels).to(device)
 elif args.net == 'unetv2':
     model = UnetN2Nv2(args.in_channels, args.out_channels).to(device)
-
+    
+# 如果args.debug为True,则打印模型结构和模型大小
 if args.debug:
     print(model)
-    print(model.model_size)
+    print(module_size(model))
 
 if args.transform == 'four_crop':
     # wide field images may have complete noise in center-crop case
+    # FiveCrop: 将图像裁剪成5个部分（四角和中心）
+    # 只使用四角的裁剪结果
+    # 将图像转换为张量
+    # 归一化处理（除以255并减去0.5）
     transform = transforms.Compose([
         transforms.FiveCrop(args.imsize),
         transforms.Lambda(lambda crops: torch.stack([
